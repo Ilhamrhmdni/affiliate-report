@@ -2,7 +2,7 @@ import io
 import os
 import re
 import hashlib
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -13,7 +13,7 @@ from openpyxl.utils import get_column_letter
 
 
 # =========================
-# Helpers: cleaning & parsing
+# Parsing helpers
 # =========================
 
 RE_NON_NUM = re.compile(r"[^0-9\-,.]+")
@@ -40,15 +40,41 @@ def parse_number(x):
         return np.nan
 
 
+def id_to_str(x) -> str:
+    """Convert IDs that might come as float/str into clean digit string."""
+    if pd.isna(x):
+        return ""
+    s = str(x).strip()
+    s = re.sub(r"\.0$", "", s)          # remove trailing .0
+    s = re.sub(r"\D+", "", s)           # keep digits only
+    return s
+
+
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df.columns = [c.strip() for c in df.columns]
+    df.columns = [str(c).strip() for c in df.columns]
 
-    # Common typos
     rename_map = {
+        # common typos / variants
         "Nama Barange": "Nama Barang",
         "Kampanye Partnerr": "Kampanye Partner",
         "Status Pemebelian": "Status Pembelian",
+
+        # shop id variants
+        "Shop ID": "ID Toko",
+        "ID Shop": "ID Toko",
+        "shopid": "ID Toko",
+        "Id Shop": "ID Toko",
+        "shop_id": "ID Toko",
+        "id_shop": "ID Toko",
+
+        # item id variants
+        "Item ID": "ID Barang",
+        "ID Item": "ID Barang",
+        "itemid": "ID Barang",
+        "Id Item": "ID Barang",
+        "item_id": "ID Barang",
+        "id_item": "ID Barang",
     }
     for k, v in rename_map.items():
         if k in df.columns and v not in df.columns:
@@ -95,17 +121,37 @@ def add_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
         df["is_pending"] = False
         df["is_completed"] = False
 
+    # ===== Link Produk (Shopee): https://shopee.co.id/product/idshop/idbarang
+    if "ID Toko" in df.columns and "ID Barang" in df.columns:
+        shop = df["ID Toko"].apply(id_to_str)
+        item = df["ID Barang"].apply(id_to_str)
+
+        df["ID Toko"] = shop
+        df["ID Barang"] = item
+
+        df["Link Produk"] = np.where(
+            (shop != "") & (item != ""),
+            "https://shopee.co.id/product/" + shop + "/" + item,
+            ""
+        )
+        df["Produk Key"] = np.where(
+            (shop != "") & (item != ""),
+            shop + "/" + item,
+            ""
+        )
+    else:
+        df["Link Produk"] = ""
+        df["Produk Key"] = ""
+
     return df
 
 
 def read_csv_bytes(raw: bytes) -> pd.DataFrame:
-    """Try encodings: utf-8-sig, utf-8, latin1."""
     for enc in ["utf-8-sig", "utf-8", "latin1"]:
         try:
             return pd.read_csv(io.BytesIO(raw), encoding=enc)
         except Exception:
             continue
-    # last resort
     return pd.read_csv(io.BytesIO(raw), encoding_errors="ignore")
 
 
@@ -129,15 +175,56 @@ def parse_many(files_payload: List[dict]) -> pd.DataFrame:
     for item in files_payload:
         raw = item["raw"]
         name = item["name"]
-        df = parse_one_file(raw, name)
-        frames.append(df)
+        frames.append(parse_one_file(raw, name))
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)
 
 
 # =========================
-# Core analytics
+# Demand metric logic
+# =========================
+
+def demand_metric_label(demand_mode: str) -> str:
+    return "Orders (unik)" if demand_mode == "Pesanan (Orders unik)" else "Produk terjual (Items/Jumlah)"
+
+
+def compute_demand_agg(df: pd.DataFrame, group_cols: List[str], demand_mode: str) -> pd.DataFrame:
+    """
+    Returns aggregated DF with:
+    - Demand (value) based on demand_mode
+    - Orders (unik) and Items (Jumlah) always included if possible
+    - GMV + Komisi included if possible
+    """
+    out = df.copy()
+
+    order_id_col = "ID Pemesanan" if "ID Pemesanan" in out.columns else None
+    has_qty = "Jumlah" in out.columns
+
+    gb = out.groupby(group_cols, dropna=False)
+
+    orders = gb[order_id_col].nunique() if order_id_col else gb.size()
+    items = gb["Jumlah"].sum() if has_qty else gb.size()
+
+    gmv = gb["Nilai Pembelian(Rp)"].sum() if "Nilai Pembelian(Rp)" in out.columns else None
+    komisi = gb["Komisi Bersih Affiliate (Rp)"].sum() if "Komisi Bersih Affiliate (Rp)" in out.columns else None
+
+    res = pd.DataFrame({
+        "Orders (unik)": orders,
+        "Items (Jumlah)": items,
+    }).reset_index()
+
+    if gmv is not None:
+        res["GMV (Rp)"] = gmv.values
+    if komisi is not None:
+        res["Komisi Bersih (Rp)"] = komisi.values
+
+    res["Demand"] = res["Orders (unik)"] if demand_mode == "Pesanan (Orders unik)" else res["Items (Jumlah)"]
+    return res
+
+
+# =========================
+# Analytics tables
 # =========================
 
 def overview_table(df: pd.DataFrame) -> pd.DataFrame:
@@ -146,6 +233,7 @@ def overview_table(df: pd.DataFrame) -> pd.DataFrame:
 
     order_id_col = "ID Pemesanan" if "ID Pemesanan" in df.columns else None
     unique_orders = df[order_id_col].nunique(dropna=True) if order_id_col else len(df)
+    items = df["Jumlah"].sum() if "Jumlah" in df.columns else len(df)
 
     total_gmv = df["Nilai Pembelian(Rp)"].sum() if "Nilai Pembelian(Rp)" in df.columns else np.nan
     total_net_comm = df["Komisi Bersih Affiliate (Rp)"].sum() if "Komisi Bersih Affiliate (Rp)" in df.columns else np.nan
@@ -154,7 +242,9 @@ def overview_table(df: pd.DataFrame) -> pd.DataFrame:
     out = [
         ("Periode", f"{date_min} s/d {date_max}"),
         ("Jumlah baris", int(len(df))),
-        ("Pesanan unik", int(unique_orders)),
+        ("Akun unik", int(df["Akun"].nunique()) if "Akun" in df.columns else 1),
+        ("Pesanan unik (Orders)", int(unique_orders)),
+        ("Produk terjual (Items/Jumlah)", float(items)),
         ("Total Nilai Pembelian (GMV)", float(total_gmv)),
         ("Total Komisi Bersih Affiliate", float(total_net_comm)),
         ("Jumlah baris status Tertunda", pending_cnt),
@@ -162,121 +252,118 @@ def overview_table(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(out, columns=["Metric", "Value"])
 
 
-def daily_totals(df: pd.DataFrame, metric_col: str) -> pd.DataFrame:
+def daily_totals(df: pd.DataFrame) -> pd.DataFrame:
     if "Tanggal" not in df.columns:
         return pd.DataFrame()
 
-    order_id_col = "ID Pemesanan" if "ID Pemesanan" in df.columns else None
-    g = df.groupby("Tanggal", dropna=False)
+    res = compute_demand_agg(df, ["Tanggal"], demand_mode="Pesanan (Orders unik)")
+    # add KPIs
+    if "GMV (Rp)" in res.columns:
+        res["AOV (Rp)"] = np.where(res["Orders (unik)"] > 0, res["GMV (Rp)"] / res["Orders (unik)"], np.nan)
+    if "Komisi Bersih (Rp)" in res.columns:
+        res["Komisi / Order (Rp)"] = np.where(res["Orders (unik)"] > 0, res["Komisi Bersih (Rp)"] / res["Orders (unik)"], np.nan)
 
-    res = pd.DataFrame({
-        "Orders (unik)": g[order_id_col].nunique() if order_id_col else g.size(),
-        "Items (Jumlah)": g["Jumlah"].sum() if "Jumlah" in df.columns else g.size(),
-        "GMV (Rp)": g["Nilai Pembelian(Rp)"].sum() if "Nilai Pembelian(Rp)" in df.columns else np.nan,
-        "Komisi Bersih (Rp)": g["Komisi Bersih Affiliate (Rp)"].sum() if "Komisi Bersih Affiliate (Rp)" in df.columns else np.nan,
-    }).reset_index()
-
-    res["AOV (Rp)"] = np.where(res["Orders (unik)"] > 0, res["GMV (Rp)"] / res["Orders (unik)"], np.nan)
-    res["Komisi / Order (Rp)"] = np.where(res["Orders (unik)"] > 0, res["Komisi Bersih (Rp)"] / res["Orders (unik)"], np.nan)
-
-    # For chart convenience
-    res["Metric (Rp)"] = res[metric_col]
     return res.sort_values("Tanggal")
 
 
-def summary_by_category(df: pd.DataFrame, level_col: str, metric_col: str) -> pd.DataFrame:
+def summary_by_category(df: pd.DataFrame, level_col: str, demand_mode: str) -> pd.DataFrame:
     if level_col not in df.columns:
         return pd.DataFrame()
 
-    order_id_col = "ID Pemesanan" if "ID Pemesanan" in df.columns else None
-    g = df.groupby(level_col, dropna=False)
+    res = compute_demand_agg(df, [level_col], demand_mode=demand_mode).rename(columns={level_col: "Kategori"})
+    total_demand = res["Demand"].sum()
+    res["Share Demand"] = np.where(total_demand > 0, res["Demand"] / total_demand, np.nan)
 
-    res = pd.DataFrame({
-        "Orders (unik)": g[order_id_col].nunique() if order_id_col else g.size(),
-        "GMV (Rp)": g["Nilai Pembelian(Rp)"].sum() if "Nilai Pembelian(Rp)" in df.columns else np.nan,
-        "Komisi Bersih (Rp)": g["Komisi Bersih Affiliate (Rp)"].sum() if "Komisi Bersih Affiliate (Rp)" in df.columns else np.nan,
-        "Items (Jumlah)": g["Jumlah"].sum() if "Jumlah" in df.columns else g.size(),
-    }).reset_index().rename(columns={level_col: "Kategori"})
-
-    total_metric = res[metric_col].sum()
-    res["Share"] = np.where(total_metric > 0, res[metric_col] / total_metric, np.nan)
-
-    return res.sort_values(metric_col, ascending=False)
+    return res.sort_values("Demand", ascending=False)
 
 
-def top_products(df: pd.DataFrame, metric_col: str, top_n: int = 30) -> pd.DataFrame:
-    if "ID Barang" not in df.columns:
+def top_products(df: pd.DataFrame, demand_mode: str, top_n: int = 30) -> pd.DataFrame:
+    # Use (ID Toko, ID Barang) so Link Produk always valid
+    keys = []
+    if "ID Toko" in df.columns:
+        keys.append("ID Toko")
+    if "ID Barang" in df.columns:
+        keys.append("ID Barang")
+
+    if not keys:
         return pd.DataFrame()
 
-    name_col = "Nama Barang" if "Nama Barang" in df.columns else None
-    keys = ["ID Barang"] + ([name_col] if name_col else [])
-    order_id_col = "ID Pemesanan" if "ID Pemesanan" in df.columns else None
+    if "Nama Barang" in df.columns:
+        keys.append("Nama Barang")
 
-    g = df.groupby(keys, dropna=False)
+    res = compute_demand_agg(df, keys, demand_mode=demand_mode)
 
-    res = pd.DataFrame({
-        "Orders (unik)": g[order_id_col].nunique() if order_id_col else g.size(),
-        "GMV (Rp)": g["Nilai Pembelian(Rp)"].sum() if "Nilai Pembelian(Rp)" in df.columns else np.nan,
-        "Komisi Bersih (Rp)": g["Komisi Bersih Affiliate (Rp)"].sum() if "Komisi Bersih Affiliate (Rp)" in df.columns else np.nan,
-        "Items (Jumlah)": g["Jumlah"].sum() if "Jumlah" in df.columns else g.size(),
-    }).reset_index()
+    # attach link
+    if "Link Produk" in df.columns and "ID Toko" in df.columns and "ID Barang" in df.columns:
+        link_map = (
+            df.loc[df["Link Produk"] != "", ["ID Toko", "ID Barang", "Link Produk"]]
+              .drop_duplicates(subset=["ID Toko", "ID Barang"])
+        )
+        res = res.merge(link_map, on=["ID Toko", "ID Barang"], how="left")
 
-    return res.sort_values(metric_col, ascending=False).head(top_n)
+    return res.sort_values("Demand", ascending=False).head(top_n)
 
 
-def top_stores(df: pd.DataFrame, metric_col: str, top_n: int = 30) -> pd.DataFrame:
+def top_stores(df: pd.DataFrame, demand_mode: str, top_n: int = 30) -> pd.DataFrame:
     if "Nama Toko" not in df.columns:
         return pd.DataFrame()
 
-    order_id_col = "ID Pemesanan" if "ID Pemesanan" in df.columns else None
-    g = df.groupby("Nama Toko", dropna=False)
-
-    res = pd.DataFrame({
-        "Orders (unik)": g[order_id_col].nunique() if order_id_col else g.size(),
-        "GMV (Rp)": g["Nilai Pembelian(Rp)"].sum() if "Nilai Pembelian(Rp)" in df.columns else np.nan,
-        "Komisi Bersih (Rp)": g["Komisi Bersih Affiliate (Rp)"].sum() if "Komisi Bersih Affiliate (Rp)" in df.columns else np.nan,
-        "Items (Jumlah)": g["Jumlah"].sum() if "Jumlah" in df.columns else g.size(),
-    }).reset_index()
-
-    return res.sort_values(metric_col, ascending=False).head(top_n)
+    res = compute_demand_agg(df, ["Nama Toko"], demand_mode=demand_mode)
+    return res.sort_values("Demand", ascending=False).head(top_n)
 
 
-def daily_top_k(df: pd.DataFrame, group_col: str, metric_source_col: str, top_k: int) -> pd.DataFrame:
-    """Per tanggal, ambil Top-K berdasarkan metric_source_col."""
-    if "Tanggal" not in df.columns or group_col not in df.columns or metric_source_col not in df.columns:
+def winning_l1_daily(df: pd.DataFrame, l1_col: str, demand_mode: str) -> pd.DataFrame:
+    if "Tanggal" not in df.columns or l1_col not in df.columns:
         return pd.DataFrame()
 
-    g = df.groupby(["Tanggal", group_col], dropna=False)[metric_source_col].sum().reset_index()
-    g = g.rename(columns={metric_source_col: "Value"})
-    g["Rank"] = g.groupby("Tanggal")["Value"].rank(method="first", ascending=False)
+    g = compute_demand_agg(df, ["Tanggal", l1_col], demand_mode=demand_mode)
+    g = g.sort_values(["Tanggal", "Demand"], ascending=[True, False])
 
-    out = g[g["Rank"] <= top_k].copy()
-    out = out.sort_values(["Tanggal", "Rank"]).rename(columns={group_col: "Item"})
-    return out
-
-
-def winning_category_per_day(df: pd.DataFrame, l1_col: str, metric_source_col: str) -> pd.DataFrame:
-    """Per tanggal: kategori L1 pemenang (metric terbesar)."""
-    if "Tanggal" not in df.columns or l1_col not in df.columns or metric_source_col not in df.columns:
-        return pd.DataFrame()
-
-    g = df.groupby(["Tanggal", l1_col], dropna=False)[metric_source_col].sum().reset_index()
-    g = g.sort_values(["Tanggal", metric_source_col], ascending=[True, False])
-
-    winner = g.groupby("Tanggal").head(1).copy()
-    winner = winner.rename(columns={l1_col: "Winning L1", metric_source_col: "Metric (Rp)"})
-
-    total_day = df.groupby("Tanggal")[metric_source_col].sum().reset_index().rename(columns={metric_source_col: "Total Metric Hari Itu (Rp)"})
+    winner = g.groupby("Tanggal").head(1).copy().rename(columns={l1_col: "Winning L1"})
+    total_day = g.groupby("Tanggal")["Demand"].sum().reset_index().rename(columns={"Demand": "Total Demand Hari Itu"})
     winner = winner.merge(total_day, on="Tanggal", how="left")
-    winner["Share"] = np.where(winner["Total Metric Hari Itu (Rp)"] > 0, winner["Metric (Rp)"] / winner["Total Metric Hari Itu (Rp)"], np.nan)
+    winner["Share"] = np.where(winner["Total Demand Hari Itu"] > 0, winner["Demand"] / winner["Total Demand Hari Itu"], np.nan)
     return winner.sort_values("Tanggal")
 
 
+def daily_top_k_category(df: pd.DataFrame, group_col: str, demand_mode: str, top_k: int) -> pd.DataFrame:
+    if "Tanggal" not in df.columns or group_col not in df.columns:
+        return pd.DataFrame()
+
+    g = compute_demand_agg(df, ["Tanggal", group_col], demand_mode=demand_mode)
+    g = g.rename(columns={group_col: "Item"})
+    g["Rank"] = g.groupby("Tanggal")["Demand"].rank(method="first", ascending=False)
+    return g[g["Rank"] <= top_k].sort_values(["Tanggal", "Rank"])
+
+
+def daily_top_k_products(df: pd.DataFrame, demand_mode: str, top_k: int) -> pd.DataFrame:
+    # Best: date + shop + item
+    if "Tanggal" not in df.columns or "ID Toko" not in df.columns or "ID Barang" not in df.columns:
+        return pd.DataFrame()
+
+    keys = ["Tanggal", "ID Toko", "ID Barang"]
+    if "Nama Barang" in df.columns:
+        keys.append("Nama Barang")
+
+    g = compute_demand_agg(df, keys, demand_mode=demand_mode)
+
+    # attach link
+    if "Link Produk" in df.columns:
+        link_map = (
+            df.loc[df["Link Produk"] != "", ["ID Toko", "ID Barang", "Link Produk"]]
+              .drop_duplicates(subset=["ID Toko", "ID Barang"])
+        )
+        g = g.merge(link_map, on=["ID Toko", "ID Barang"], how="left")
+
+    g["Rank"] = g.groupby("Tanggal")["Demand"].rank(method="first", ascending=False)
+    return g[g["Rank"] <= top_k].sort_values(["Tanggal", "Rank"])
+
+
 # =========================
-# Excel export formatting
+# Excel styling/export
 # =========================
 
-def autosize_columns(ws, max_width: int = 55):
+def autosize_columns(ws, max_width: int = 60):
     for col in ws.columns:
         col_letter = get_column_letter(col[0].column)
         max_len = 0
@@ -338,7 +425,7 @@ def export_excel_bytes(tables: Dict[str, pd.DataFrame]) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         for sheet, table in tables.items():
-            safe_sheet = sheet[:31]  # Excel limit
+            safe_sheet = sheet[:31]
             table.to_excel(writer, sheet_name=safe_sheet, index=False)
 
     buf.seek(0)
@@ -349,24 +436,14 @@ def export_excel_bytes(tables: Dict[str, pd.DataFrame]) -> bytes:
         style_header(ws, 1)
         autosize_columns(ws)
 
-        # Format by sheet
-        if sheet in ["Daily Totals", "Winning L1 Daily", "Daily Top L1 Top3", "Daily Top Products Top5"]:
-            apply_number_formats(
-                ws,
-                currency_cols=["GMV (Rp)", "Komisi Bersih (Rp)", "AOV (Rp)", "Komisi / Order (Rp)", "Metric (Rp)", "Value", "Total Metric Hari Itu (Rp)"],
-                percent_cols=["Share"],
-                date_cols=["Tanggal"],
-                int_cols=["Orders (unik)", "Items (Jumlah)", "Rank"]
-            )
-
-        if sheet in ["Summary L1", "Summary L2", "Top Products", "Top Stores"]:
-            apply_number_formats(
-                ws,
-                currency_cols=["GMV (Rp)", "Komisi Bersih (Rp)"],
-                percent_cols=["Share"],
-                date_cols=["Tanggal"],
-                int_cols=["Orders (unik)", "Items (Jumlah)"]
-            )
+        # generic formats
+        apply_number_formats(
+            ws,
+            currency_cols=["GMV (Rp)", "Komisi Bersih (Rp)", "AOV (Rp)", "Komisi / Order (Rp)"],
+            percent_cols=["Share Demand", "Share"],
+            date_cols=["Tanggal"],
+            int_cols=["Orders (unik)", "Items (Jumlah)", "Demand", "Total Demand Hari Itu", "Rank"]
+        )
 
     out = io.BytesIO()
     wb.save(out)
@@ -377,41 +454,39 @@ def export_excel_bytes(tables: Dict[str, pd.DataFrame]) -> bytes:
 # Streamlit UI
 # =========================
 
-st.set_page_config(page_title="Affiliate Analyzer", layout="wide")
-
-st.title("📊 Affiliate Winning Analyzer (CSV → Insight + Excel)")
+st.set_page_config(page_title="Affiliate Demand Winning Analyzer", layout="wide")
+st.title("📊 Affiliate Winning Analyzer (Winning = Demand Konsumen)")
 
 with st.sidebar:
-    st.header("Upload & Settings")
+    st.header("Upload")
     uploaded = st.file_uploader("Upload CSV (bisa banyak akun)", type=["csv"], accept_multiple_files=True)
 
-    metric_choice = st.selectbox(
-        "Winning berdasarkan apa?",
-        ["Komisi Bersih (Rp)", "GMV (Rp)"],
+    st.divider()
+    st.header("Winning Metric (Demand)")
+    demand_mode = st.selectbox(
+        "Winning berdasarkan:",
+        ["Pesanan (Orders unik)", "Produk terjual (Items/Jumlah)"],
         index=0
     )
-    metric_source_col = "Komisi Bersih Affiliate (Rp)" if metric_choice == "Komisi Bersih (Rp)" else "Nilai Pembelian(Rp)"
-
-    top_products_n = st.slider("Top Products (overall)", 5, 100, 30, 5)
-    top_stores_n = st.slider("Top Stores (overall)", 5, 100, 30, 5)
+    demand_col_name = demand_metric_label(demand_mode)
 
     st.divider()
-    only_pending = st.checkbox("Filter hanya Status Pesanan = Tertunda", value=False)
-    only_completed = st.checkbox("Filter hanya pesanan selesai/dibayarkan (flag)", value=False)
+    st.header("Filter")
+    only_pending = st.checkbox("Hanya Status Pesanan = Tertunda", value=False)
+    only_completed = st.checkbox("Hanya pesanan selesai/dibayarkan (flag)", value=False)
+
+    st.divider()
+    st.header("Top-N")
+    top_products_n = st.slider("Top Products (overall)", 5, 200, 30, 5)
+    top_stores_n = st.slider("Top Stores (overall)", 5, 200, 30, 5)
 
 if not uploaded:
     st.info("Upload satu atau beberapa CSV dulu ya.")
     st.stop()
 
-# Prepare payload for caching
-files_payload = []
-for f in uploaded:
-    raw = f.getvalue()
-    files_payload.append({"name": f.name, "raw": raw, "md5": file_md5(raw)})
-
+files_payload = [{"name": f.name, "raw": f.getvalue(), "md5": file_md5(f.getvalue())} for f in uploaded]
 df = parse_many(files_payload)
 
-# Basic validation
 if df.empty:
     st.error("Data kosong / gagal dibaca.")
     st.stop()
@@ -427,83 +502,116 @@ if only_completed and "is_completed" in work.columns:
 if "Tanggal" in work.columns and work["Tanggal"].notna().any():
     dmin = pd.to_datetime(work["Tanggal"].min())
     dmax = pd.to_datetime(work["Tanggal"].max())
-    colA, colB, colC = st.columns([1, 1, 2])
-    with colA:
+    c1, c2, c3 = st.columns([1, 1, 2])
+    with c1:
         start = st.date_input("Tanggal mulai", value=dmin.date(), min_value=dmin.date(), max_value=dmax.date())
-    with colB:
+    with c2:
         end = st.date_input("Tanggal akhir", value=dmax.date(), min_value=dmin.date(), max_value=dmax.date())
-    work = work[(pd.to_datetime(work["Tanggal"]) >= pd.to_datetime(start)) & (pd.to_datetime(work["Tanggal"]) <= pd.to_datetime(end))]
+
+    work = work[
+        (pd.to_datetime(work["Tanggal"]) >= pd.to_datetime(start)) &
+        (pd.to_datetime(work["Tanggal"]) <= pd.to_datetime(end))
+    ]
 
 # Build tables
 tables: Dict[str, pd.DataFrame] = {}
-
 tables["Overview"] = overview_table(work)
+tables["Daily Totals"] = daily_totals(work)
 
-daily = daily_totals(work, metric_col=metric_choice)
-tables["Daily Totals"] = daily
+tables["Summary L1"] = summary_by_category(work, "L1 Kategori Global", demand_mode=demand_mode)
+tables["Summary L2"] = summary_by_category(work, "L2 Kategori Global", demand_mode=demand_mode)
 
-tables["Summary L1"] = summary_by_category(work, "L1 Kategori Global", metric_col=metric_choice)
-tables["Summary L2"] = summary_by_category(work, "L2 Kategori Global", metric_col=metric_choice)
+tables["Top Products"] = top_products(work, demand_mode=demand_mode, top_n=top_products_n)
+tables["Top Stores"] = top_stores(work, demand_mode=demand_mode, top_n=top_stores_n)
 
-tables["Top Products"] = top_products(work, metric_col=metric_choice, top_n=top_products_n)
-tables["Top Stores"] = top_stores(work, metric_col=metric_choice, top_n=top_stores_n)
+tables["Winning L1 Daily"] = winning_l1_daily(work, l1_col="L1 Kategori Global", demand_mode=demand_mode)
+tables["Daily Top L1 Top3"] = daily_top_k_category(work, "L1 Kategori Global", demand_mode=demand_mode, top_k=3)
+tables["Daily Top Products Top5"] = daily_top_k_products(work, demand_mode=demand_mode, top_k=5)
 
-tables["Winning L1 Daily"] = winning_category_per_day(work, l1_col="L1 Kategori Global", metric_source_col=metric_source_col)
-tables["Daily Top L1 Top3"] = daily_top_k(work, group_col="L1 Kategori Global", metric_source_col=metric_source_col, top_k=3)
+# =========================
+# Display
+# =========================
 
-prod_col = "Nama Barang" if "Nama Barang" in work.columns else ("ID Barang" if "ID Barang" in work.columns else None)
-if prod_col:
-    tables["Daily Top Products Top5"] = daily_top_k(work, group_col=prod_col, metric_source_col=metric_source_col, top_k=5)
-
-# Layout
-tab1, tab2, tab3 = st.tabs(["📌 Overview", "📈 Harian", "🏆 Winning & Detail"])
+tab1, tab2, tab3 = st.tabs(["📌 Overview", "📈 Harian", "🏆 Winning (Demand)"])
 
 with tab1:
     st.subheader("Overview")
     st.dataframe(tables["Overview"], use_container_width=True)
-
-    st.caption(f"Rows: {len(work):,} | Akun unik: {work['Akun'].nunique() if 'Akun' in work.columns else 1}")
+    st.caption(f"Rows: {len(work):,} | Akun unik: {work['Akun'].nunique() if 'Akun' in work.columns else 1:,}")
 
 with tab2:
     st.subheader("Daily Totals")
     st.dataframe(tables["Daily Totals"], use_container_width=True)
 
-    if not daily.empty:
-        chart_df = daily.set_index("Tanggal")[["GMV (Rp)", "Komisi Bersih (Rp)"]].copy()
-        st.line_chart(chart_df)
+    # Charts: demand & gmv/komisi
+    if not tables["Daily Totals"].empty:
+        dt = tables["Daily Totals"].set_index("Tanggal")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown(f"**Trend Demand** ({demand_col_name})")
+            if demand_mode == "Pesanan (Orders unik)":
+                st.line_chart(dt[["Orders (unik)"]])
+            else:
+                st.line_chart(dt[["Items (Jumlah)"]])
+
+        with c2:
+            cols = []
+            if "GMV (Rp)" in dt.columns: cols.append("GMV (Rp)")
+            if "Komisi Bersih (Rp)" in dt.columns: cols.append("Komisi Bersih (Rp)")
+            if cols:
+                st.markdown("**Trend GMV / Komisi (konteks)**")
+                st.line_chart(dt[cols])
 
 with tab3:
     c1, c2 = st.columns(2)
+
     with c1:
-        st.subheader("Summary L1 (Overall)")
-        st.dataframe(tables["Summary L1"].head(30), use_container_width=True)
+        st.subheader(f"Summary L1 (Overall) — Ranking by {demand_col_name}")
+        st.dataframe(tables["Summary L1"].head(50), use_container_width=True)
+
     with c2:
         st.subheader("Winning L1 per Hari")
         st.dataframe(tables["Winning L1 Daily"], use_container_width=True)
 
-    st.subheader("Top Products / Stores")
+    st.subheader("Top Products / Stores (Overall)")
     c3, c4 = st.columns(2)
+
     with c3:
-        st.dataframe(tables["Top Products"], use_container_width=True)
+        if "Link Produk" in tables["Top Products"].columns:
+            st.dataframe(
+                tables["Top Products"],
+                use_container_width=True,
+                column_config={"Link Produk": st.column_config.LinkColumn("Link Produk")},
+            )
+        else:
+            st.dataframe(tables["Top Products"], use_container_width=True)
+
     with c4:
         st.dataframe(tables["Top Stores"], use_container_width=True)
 
-    st.subheader("Daily Winners")
+    st.subheader("Daily Winners (Top)")
     c5, c6 = st.columns(2)
     with c5:
         st.dataframe(tables["Daily Top L1 Top3"], use_container_width=True)
     with c6:
-        if "Daily Top Products Top5" in tables:
+        if "Link Produk" in tables["Daily Top Products Top5"].columns:
+            st.dataframe(
+                tables["Daily Top Products Top5"],
+                use_container_width=True,
+                column_config={"Link Produk": st.column_config.LinkColumn("Link Produk")},
+            )
+        else:
             st.dataframe(tables["Daily Top Products Top5"], use_container_width=True)
 
-# Download excel
+# Export
 st.divider()
-st.subheader("⬇️ Export Report")
+st.subheader("⬇️ Download Excel Report")
 excel_bytes = export_excel_bytes(tables)
 st.download_button(
     "Download Excel Report",
     data=excel_bytes,
-    file_name="affiliate_report.xlsx",
+    file_name="affiliate_demand_winning_report.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
-st.caption("Tip: kalau file besar, pakai filter tanggal / status dulu supaya lebih ringan.")
+st.caption("Winning di report ini berdasarkan demand (Orders atau Items), GMV/Komisi hanya sebagai konteks.")
